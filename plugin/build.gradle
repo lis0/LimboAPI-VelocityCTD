@@ -13,7 +13,7 @@ plugins() {
 }
 
 compileJava() {
-  getOptions().getRelease().set(21)
+  getOptions().getRelease().set(25)
   getOptions().setEncoding("UTF-8")
 }
 
@@ -309,7 +309,11 @@ File generateData(MinecraftVersion version) {
     File java = new File(System.getProperty("java.home"), "bin/java")
     commandLine = ["bash", "-c", String.format(command, java)]
   }
-  commandLine.execute([], parent).waitFor()
+  Process dataGenProcess = commandLine.execute([], parent)
+  // Drain stdout/stderr concurrently: the data generator prints a lot of extraction/report
+  // progress, and without consuming it the OS pipe buffer fills up and deadlocks waitFor().
+  dataGenProcess.consumeProcessOutput(System.out, System.err)
+  dataGenProcess.waitFor()
 
   // Remove/compact files, reduces disk usage from ~2.9gb to ~92mb (or ~9.5mb on a compressed filesystem)
   jarFile.delete()

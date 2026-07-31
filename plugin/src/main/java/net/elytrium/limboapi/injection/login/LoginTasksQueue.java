@@ -222,14 +222,10 @@ public class LoginTasksQueue {
         if (reason.isPresent()) {
           this.player.disconnect0(reason.get(), false);
         } else {
-          if (this.server.registerConnection(this.player)) {
-            if (connection.getActiveSessionHandler() instanceof LoginConfirmHandler confirm) {
-              confirm.waitForConfirmation(() -> this.connectToServer(logger, this.player, connection));
-            } else {
-              this.connectToServer(logger, this.player, connection);
-            }
+          if (connection.getActiveSessionHandler() instanceof LoginConfirmHandler confirm) {
+            confirm.waitForConfirmation(() -> this.connectToServer(logger, this.player, connection));
           } else {
-            this.player.disconnect0(Component.translatable("velocity.error.already-connected-proxy"), false);
+            this.connectToServer(logger, this.player, connection);
           }
         }
       }

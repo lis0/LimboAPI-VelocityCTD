@@ -48,7 +48,7 @@ import com.velocitypowered.api.util.UuidUtils;
 import com.velocitypowered.natives.compression.VelocityCompressor;
 import com.velocitypowered.natives.util.Natives;
 import com.velocitypowered.proxy.VelocityServer;
-import com.velocitypowered.proxy.config.PlayerInfoForwarding;
+import com.velocitypowered.api.proxy.server.PlayerInfoForwarding;
 import com.velocitypowered.proxy.config.VelocityConfiguration;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
 import com.velocitypowered.proxy.connection.client.AuthSessionHandler;
@@ -144,10 +144,12 @@ public class LoginListener {
       Object handler = connection.getActiveSessionHandler();
       MC_CONNECTION_SETTER.accept(handler, CLOSED_MINECRAFT_CONNECTION);
 
-      LoginConfirmHandler loginHandler = null;
+      final LoginConfirmHandler loginHandler;
       if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
-        connection.setActiveSessionHandler(StateRegistry.LOGIN,
-            loginHandler = new LoginConfirmHandler(this.plugin, connection));
+        loginHandler = new LoginConfirmHandler(this.plugin, connection);
+        connection.setActiveSessionHandler(StateRegistry.LOGIN, loginHandler);
+      } else {
+        loginHandler = null;
       }
 
       // From Velocity.
@@ -190,85 +192,100 @@ public class LoginListener {
           if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
             loginHandler.setPlayer(player);
           }
-          if (this.server.canRegisterConnection(player)) {
-            if (!connection.isClosed()) {
-              // Complete the Login process.
-              int threshold = this.server.getConfiguration().getCompressionThreshold();
-              ChannelPipeline pipeline = connection.getChannel().pipeline();
-              boolean compressionEnabled = threshold >= 0 && connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_8) >= 0
-                  && pipeline.context(Connections.FRAME_ENCODER) != null;
-              if (compressionEnabled) {
-                connection.write(new SetCompressionPacket(threshold));
-                this.plugin.fixDecompressor(pipeline, threshold, true);
-                if (!Settings.IMP.MAIN.COMPATIBILITY_MODE) {
-                  pipeline.addFirst(Connections.COMPRESSION_ENCODER, new ChannelOutboundHandlerAdapter());
-                } else {
-                  int level = this.server.getConfiguration().getCompressionLevel();
-                  VelocityCompressor compressor = Natives.compress.get().create(level);
-                  pipeline.addBefore(Connections.MINECRAFT_ENCODER, Connections.COMPRESSION_ENCODER,
-                      new MinecraftCompressorAndLengthEncoder(threshold, compressor));
-                  pipeline.remove(Connections.FRAME_ENCODER);
-                }
-              }
 
-              if (!Settings.IMP.MAIN.COMPATIBILITY_MODE) {
-                pipeline.remove(Connections.FRAME_ENCODER);
-              }
+          this.server.registerConnection(player).whenCompleteAsync((registered, throwable) -> {
+            if (throwable != null) {
+              inbound.getConnection().close();
+              LimboAPI.getLogger().error("Exception while registering connection for {}", player, throwable);
+              return;
+            }
 
-              this.plugin.inject3rdParty(player, connection, pipeline);
-              if (compressionEnabled) {
-                pipeline.fireUserEventTriggered(VelocityConnectionEvent.COMPRESSION_ENABLED);
-              } else {
-                pipeline.fireUserEventTriggered(VelocityConnectionEvent.COMPRESSION_DISABLED);
-              }
+            try {
+              if (registered) {
+                this.server.getPlayerRegistry().finalizeLogin(player);
 
-              VelocityConfiguration configuration = this.server.getConfiguration();
-              UUID playerUniqueID = player.getUniqueId();
-              if (configuration.getPlayerInfoForwardingMode() == PlayerInfoForwarding.NONE) {
-                playerUniqueID = UuidUtils.generateOfflinePlayerUuid(player.getUsername());
-              }
-
-              ServerLoginSuccessPacket success = new ServerLoginSuccessPacket();
-              success.setUsername(player.getUsername());
-              success.setProperties(player.getGameProfileProperties());
-              success.setUuid(playerUniqueID);
-              success.setSessionId(this.server.getSessionId());
-
-              if (Settings.IMP.MAIN.COMPATIBILITY_MODE) {
-                connection.write(success);
-              } else {
-                ServerLoginSuccessHook successHook = new ServerLoginSuccessHook();
-                successHook.setUsername(player.getUsername());
-                successHook.setProperties(player.getGameProfileProperties());
-                successHook.setUuid(playerUniqueID);
-                successHook.setSessionId(this.server.getSessionId());
-                connection.write(successHook);
-
-                ChannelHandler compressionHandler = pipeline.get(Connections.COMPRESSION_ENCODER);
-                if (compressionHandler != null) {
-                  connection.write(this.plugin.encodeSingleLogin(success, connection.getProtocolVersion()));
-                } else {
-                  ChannelHandler frameHandler = pipeline.get(Connections.FRAME_ENCODER);
-                  if (frameHandler != null) {
-                    pipeline.remove(frameHandler);
+                if (!connection.isClosed()) {
+                  int threshold = this.server.getConfiguration().getCompressionThreshold();
+                  ChannelPipeline pipeline = connection.getChannel().pipeline();
+                  boolean compressionEnabled = threshold >= 0 && connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_8) >= 0
+                      && pipeline.context(Connections.FRAME_ENCODER) != null;
+                  if (compressionEnabled) {
+                    connection.write(new SetCompressionPacket(threshold));
+                    this.plugin.fixDecompressor(pipeline, threshold, true);
+                    if (!Settings.IMP.MAIN.COMPATIBILITY_MODE) {
+                      pipeline.addFirst(Connections.COMPRESSION_ENCODER, new ChannelOutboundHandlerAdapter());
+                    } else {
+                      int level = this.server.getConfiguration().getCompressionLevel();
+                      VelocityCompressor compressor = Natives.compress.get().create(level);
+                      pipeline.addBefore(Connections.MINECRAFT_ENCODER, Connections.COMPRESSION_ENCODER,
+                          new MinecraftCompressorAndLengthEncoder(threshold, compressor));
+                      pipeline.remove(Connections.FRAME_ENCODER);
+                    }
                   }
 
-                  connection.write(this.plugin.encodeSingleLoginUncompressed(success, connection.getProtocolVersion()));
+                  if (!Settings.IMP.MAIN.COMPATIBILITY_MODE) {
+                    pipeline.remove(Connections.FRAME_ENCODER);
+                  }
+
+                  this.plugin.inject3rdParty(player, connection, pipeline);
+                  if (compressionEnabled) {
+                    pipeline.fireUserEventTriggered(VelocityConnectionEvent.COMPRESSION_ENABLED);
+                  } else {
+                    pipeline.fireUserEventTriggered(VelocityConnectionEvent.COMPRESSION_DISABLED);
+                  }
+
+                  VelocityConfiguration configuration = this.server.getConfiguration();
+                  UUID playerUniqueID = player.getUniqueId();
+                  if (configuration.getPlayerInfoForwardingMode() == PlayerInfoForwarding.NONE) {
+                    playerUniqueID = UuidUtils.generateOfflinePlayerUuid(player.getUsername());
+                  }
+
+                  ServerLoginSuccessPacket success = new ServerLoginSuccessPacket();
+                  success.setUsername(player.getUsername());
+                  success.setProperties(player.getGameProfileProperties());
+                  success.setUuid(playerUniqueID);
+                  success.setSessionId(this.server.getSessionId());
+
+                  if (Settings.IMP.MAIN.COMPATIBILITY_MODE) {
+                    connection.write(success);
+                  } else {
+                    ServerLoginSuccessHook successHook = new ServerLoginSuccessHook();
+                    successHook.setUsername(player.getUsername());
+                    successHook.setProperties(player.getGameProfileProperties());
+                    successHook.setUuid(playerUniqueID);
+                    successHook.setSessionId(this.server.getSessionId());
+                    connection.write(successHook);
+
+                    ChannelHandler compressionHandler = pipeline.get(Connections.COMPRESSION_ENCODER);
+                    if (compressionHandler != null) {
+                      connection.write(this.plugin.encodeSingleLogin(success, connection.getProtocolVersion()));
+                    } else {
+                      ChannelHandler frameHandler = pipeline.get(Connections.FRAME_ENCODER);
+                      if (frameHandler != null) {
+                        pipeline.remove(frameHandler);
+                      }
+
+                      connection.write(this.plugin.encodeSingleLoginUncompressed(success, connection.getProtocolVersion()));
+                    }
+                  }
+
+                  this.plugin.setInitialID(player, playerUniqueID);
+
+                  if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
+                    loginHandler.thenRun(() -> this.fireRegisterEvent(player, connection, inbound, handler));
+                  } else {
+                    connection.setState(StateRegistry.PLAY);
+                    this.fireRegisterEvent(player, connection, inbound, handler);
+                  }
                 }
-              }
-
-              this.plugin.setInitialID(player, playerUniqueID);
-
-              if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
-                loginHandler.thenRun(() -> this.fireRegisterEvent(player, connection, inbound, handler));
               } else {
-                connection.setState(StateRegistry.PLAY);
-                this.fireRegisterEvent(player, connection, inbound, handler);
+                player.disconnect0(Component.translatable("velocity.error.already-connected-proxy", NamedTextColor.RED), true);
               }
+            } catch (Throwable e) {
+              inbound.getConnection().close();
+              LimboAPI.getLogger().error("Exception while finishing login for {}", player, e);
             }
-          } else {
-            player.disconnect0(Component.translatable("velocity.error.already-connected-proxy", NamedTextColor.RED), true);
-          }
+          }, connection.eventLoop());
         } catch (Throwable e) {
           inbound.getConnection().close();
           throw e;

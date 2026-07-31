@@ -1,5 +1,6 @@
 dependencyResolutionManagement {
     repositories {
+        mavenLocal()
         mavenCentral()
         maven {
             name = "elytrium-repo"
