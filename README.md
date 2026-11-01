@@ -1,5 +1,3 @@
-<img src="https://elytrium.net/src/img/elytrium.webp" alt="Elytrium" align="right">
-
 # LimboAPI
 
 Library for sending players to virtual servers (called limbo)
