@@ -43,12 +43,12 @@ import com.velocitypowered.api.network.ProtocolVersion;
 import com.velocitypowered.api.proxy.InboundConnection;
 import com.velocitypowered.api.proxy.crypto.IdentifiedKey;
 import com.velocitypowered.api.proxy.player.TabList;
+import com.velocitypowered.api.proxy.server.PlayerInfoForwarding;
 import com.velocitypowered.api.util.GameProfile;
 import com.velocitypowered.api.util.UuidUtils;
 import com.velocitypowered.natives.compression.VelocityCompressor;
 import com.velocitypowered.natives.util.Natives;
 import com.velocitypowered.proxy.VelocityServer;
-import com.velocitypowered.api.proxy.server.PlayerInfoForwarding;
 import com.velocitypowered.proxy.config.VelocityConfiguration;
 import com.velocitypowered.proxy.connection.MinecraftConnection;
 import com.velocitypowered.proxy.connection.client.AuthSessionHandler;
@@ -96,6 +96,7 @@ public class LoginListener {
 
   private static final MethodHandle DELEGATE_FIELD;
   private static final BiConsumer<Object, MinecraftConnection> MC_CONNECTION_SETTER;
+  private static final BiConsumer<Object, ConnectedPlayer> CONNECTED_PLAYER_SETTER;
   private static final MethodHandle CONNECTED_PLAYER_CONSTRUCTOR;
   private static final MethodHandle SPAWNED_FIELD;
   private static final BiConsumer<ConnectedPlayer, TabList> TAB_LIST_SETTER;
@@ -191,6 +192,8 @@ public class LoginListener {
 
           if (connection.getProtocolVersion().compareTo(ProtocolVersion.MINECRAFT_1_20_2) >= 0) {
             loginHandler.setPlayer(player);
+          } else {
+            CONNECTED_PLAYER_SETTER.accept(handler, player);
           }
 
           this.server.registerConnection(player).whenCompleteAsync((registered, throwable) -> {
@@ -258,14 +261,15 @@ public class LoginListener {
 
                     ChannelHandler compressionHandler = pipeline.get(Connections.COMPRESSION_ENCODER);
                     if (compressionHandler != null) {
-                      connection.write(this.plugin.encodeSingleLogin(success, connection.getProtocolVersion()));
+                      connection.write(this.plugin.encodeSingleLogin(success, connection.getProtocolVersion(), connection.getChannel().alloc()));
                     } else {
                       ChannelHandler frameHandler = pipeline.get(Connections.FRAME_ENCODER);
                       if (frameHandler != null) {
                         pipeline.remove(frameHandler);
                       }
 
-                      connection.write(this.plugin.encodeSingleLoginUncompressed(success, connection.getProtocolVersion()));
+                      connection.write(this.plugin.encodeSingleLoginUncompressed(
+                          success, connection.getProtocolVersion(), connection.getChannel().alloc()));
                     }
                   }
 
@@ -297,6 +301,10 @@ public class LoginListener {
   private void fireRegisterEvent(ConnectedPlayer player, MinecraftConnection connection,
       InitialInboundConnection inbound, Object handler) {
     this.server.getEventManager().fire(new LoginLimboRegisterEvent(player)).thenAcceptAsync(limboRegisterEvent -> {
+      if (connection.isClosed()) {
+        return;
+      }
+
       LoginTasksQueue queue = new LoginTasksQueue(this.plugin, handler, this.server, player, inbound, limboRegisterEvent.getOnJoinCallbacks());
       this.plugin.addLoginQueue(player, queue);
       this.plugin.setKickCallback(player, limboRegisterEvent.getOnKickCallback());
@@ -355,6 +363,10 @@ public class LoginListener {
       Field mcConnectionField = AuthSessionHandler.class.getDeclaredField("mcConnection");
       mcConnectionField.setAccessible(true);
       MC_CONNECTION_SETTER = LambdaUtil.setterOf(mcConnectionField);
+
+      Field connectedPlayerField = AuthSessionHandler.class.getDeclaredField("connectedPlayer");
+      connectedPlayerField.setAccessible(true);
+      CONNECTED_PLAYER_SETTER = LambdaUtil.setterOf(connectedPlayerField);
 
       SPAWNED_FIELD = MethodHandles.privateLookupIn(ClientPlaySessionHandler.class, MethodHandles.lookup())
           .findSetter(ClientPlaySessionHandler.class, "spawned", boolean.class);

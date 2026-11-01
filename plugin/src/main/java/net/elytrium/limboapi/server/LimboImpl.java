@@ -78,6 +78,7 @@ import java.util.Map;
 import java.util.Map.Entry;
 import java.util.Objects;
 import java.util.UUID;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.ScheduledFuture;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.TimeUnit;
@@ -140,7 +141,7 @@ public class LimboImpl implements Limbo {
   private static final CompoundBinaryTag DAMAGE_TYPE_1194;
   private static final CompoundBinaryTag DAMAGE_TYPE_120;
 
-  private final Map<Class<? extends LimboSessionHandler>, PreparedPacket> brandMessages = new HashMap<>(2);
+  private final Map<Class<? extends LimboSessionHandler>, PreparedPacket> brandMessages = new ConcurrentHashMap<>(2);
   private final LimboAPI plugin;
   private final VirtualWorld world;
 
@@ -177,7 +178,7 @@ public class LimboImpl implements Limbo {
   private int viewDistance = Settings.IMP.MAIN.VIEW_DISTANCE;
   private int simulationDistance = Settings.IMP.MAIN.SIMULATION_DISTANCE;
   private volatile boolean built = true;
-  private boolean disposeScheduled = false;
+  private volatile boolean disposeScheduled = false;
 
   public LimboImpl(LimboAPI plugin, VirtualWorld world) {
     this.plugin = plugin;
@@ -188,6 +189,10 @@ public class LimboImpl implements Limbo {
   }
 
   protected void refresh() {
+    if (this.localStateRegistry != LimboProtocol.getLimboStateRegistry()) {
+      this.plugin.getPreparedPacketFactory().addStateRegistry(this.localStateRegistry);
+    }
+
     JoinGamePacket legacyJoinGame = this.createLegacyJoinGamePacket();
     JoinGamePacket joinGame = this.createJoinGamePacket(ProtocolVersion.MINECRAFT_1_16);
     JoinGamePacket joinGame1162 = this.createJoinGamePacket(ProtocolVersion.MINECRAFT_1_16_2);
@@ -249,11 +254,12 @@ public class LimboImpl implements Limbo {
     this.createRegistrySyncModern(configPackets, ProtocolVersion.MINECRAFT_1_21_2, ProtocolVersion.MINECRAFT_1_21_4);
     this.createRegistrySyncModern(configPackets, ProtocolVersion.MINECRAFT_1_21_5, ProtocolVersion.MINECRAFT_1_21_9);
     this.createRegistrySyncModern(configPackets, ProtocolVersion.MINECRAFT_1_21_11, ProtocolVersion.MINECRAFT_1_21_11);
-    this.createRegistrySyncModern(configPackets, ProtocolVersion.MINECRAFT_26_1, ProtocolVersion.MAXIMUM_VERSION);
+    this.createRegistrySyncModern(configPackets, ProtocolVersion.MINECRAFT_26_1, ProtocolVersion.MINECRAFT_26_2);
+    this.createRegistrySyncModern(configPackets, ProtocolVersion.MINECRAFT_26_3, ProtocolVersion.MAXIMUM_VERSION);
     if (this.shouldUpdateTags) {
       configPackets.prepare(this::createTagsUpdate, ProtocolVersion.MINECRAFT_1_20_2);
     } else {
-      // 26.1 requires tags to persist.
+      // 26.1+ requires tags to persist.
       configPackets.prepare(this::createTagsUpdate, ProtocolVersion.MINECRAFT_26_1);
     }
     configPackets.prepare(FinishedUpdatePacket.INSTANCE, ProtocolVersion.MINECRAFT_1_20_2);
@@ -315,7 +321,7 @@ public class LimboImpl implements Limbo {
           tags = Arrays.copyOf(tags, id + 1);
         }
 
-        tags[id] = Pair.of(element.getString("name"), element.getCompound("element"));
+        tags[id] = Pair.of(element.getString("name"), element.get("element"));
         if (emptyTag == null) {
           emptyTag = tags[id];
         }
@@ -364,23 +370,7 @@ public class LimboImpl implements Limbo {
 
   @Override
   public void spawnPlayer(Player apiPlayer, LimboSessionHandler handler) {
-    if (!this.built) {
-      synchronized (this) {
-        if (!this.built) {
-          List<PreparedPacket> packets = this.takeSnapshot();
-          try {
-            this.refresh();
-          } finally {
-            List<PreparedPacket> changed = this.takeSnapshot();
-            for (PreparedPacket packet : packets) {
-              if (!changed.contains(packet)) {
-                this.queuedToRelease.add(packet);
-              }
-            }
-          }
-        }
-      }
-    }
+    this.ensureBuilt();
 
     ConnectedPlayer player = (ConnectedPlayer) apiPlayer;
     MinecraftConnection connection = player.getConnection();
@@ -430,6 +420,26 @@ public class LimboImpl implements Limbo {
 
     if (shouldSpawnPlayerImmediately) {
       this.spawnPlayerLocal(player, handler, null);
+    }
+  }
+
+  private void ensureBuilt() {
+    if (!this.built) {
+      synchronized (this) {
+        if (!this.built) {
+          List<PreparedPacket> packets = this.takeSnapshot();
+          try {
+            this.refresh();
+          } finally {
+            List<PreparedPacket> changed = this.takeSnapshot();
+            for (PreparedPacket packet : packets) {
+              if (!changed.contains(packet)) {
+                this.queuedToRelease.add(packet);
+              }
+            }
+          }
+        }
+      }
     }
   }
 
@@ -544,10 +554,14 @@ public class LimboImpl implements Limbo {
       if (connection.getActiveSessionHandler() instanceof LoginConfirmHandler confirm) {
         confirm.waitForConfirmation(() -> {
           this.currentOnline.increment();
+          sessionHandler.setCounted();
+          this.ensureBuilt();
           this.spawnPlayerLocal(handlerClass, sessionHandler, player, connection);
         });
       } else {
         this.currentOnline.increment();
+        sessionHandler.setCounted();
+        this.ensureBuilt();
         this.spawnPlayerLocal(handlerClass, sessionHandler, player, connection);
       }
     });
@@ -655,9 +669,18 @@ public class LimboImpl implements Limbo {
 
   public void onDisconnect() {
     this.currentOnline.decrement();
+    if (this.currentOnline.sum() != 0 || !this.disposeScheduled && this.queuedToRelease.isEmpty()) {
+      return;
+    }
 
-    if (!this.queuedToRelease.isEmpty() && this.currentOnline.sum() == 0) {
-      synchronized (this) {
+    synchronized (this) {
+      if (this.currentOnline.sum() != 0) {
+        return;
+      }
+
+      if (this.disposeScheduled) {
+        this.localDispose();
+      } else if (!this.queuedToRelease.isEmpty()) {
         PreparedPacket[] packets = this.queuedToRelease.toArray(new PreparedPacket[0]);
         this.queuedToRelease.clear();
 
@@ -668,10 +691,6 @@ public class LimboImpl implements Limbo {
           }
         }).delay(10, TimeUnit.SECONDS).schedule();
       }
-    }
-
-    if (this.disposeScheduled && this.currentOnline.sum() == 0) {
-      this.localDispose();
     }
   }
 
@@ -791,11 +810,10 @@ public class LimboImpl implements Limbo {
   }
 
   @Override
-  public void dispose() {
+  public synchronized void dispose() {
+    this.disposeScheduled = true;
     if (this.getCurrentOnline() == 0) {
       this.localDispose();
-    } else {
-      this.disposeScheduled = true;
     }
   }
 
@@ -834,10 +852,19 @@ public class LimboImpl implements Limbo {
   }
 
   private void localDispose() {
-    this.takeSnapshot().forEach(PreparedPacket::release);
     this.built = false;
+    if (this.currentOnline.sum() != 0) {
+      return;
+    }
+
+    this.takeSnapshot().forEach(PreparedPacket::release);
+    this.queuedToRelease.forEach(PreparedPacket::release);
+    this.queuedToRelease.clear();
     this.brandMessages.values().forEach(PreparedPacket::release);
     this.brandMessages.clear();
+    if (this.localStateRegistry != LimboProtocol.getLimboStateRegistry()) {
+      this.plugin.getPreparedPacketFactory().removeStateRegistry(this.localStateRegistry);
+    }
   }
 
   // From Velocity.
@@ -851,11 +878,11 @@ public class LimboImpl implements Limbo {
     }
   }
 
-  private CompoundBinaryTag createRegistry(String registryName, Map<String, CompoundBinaryTag> tags) {
+  private <T extends BinaryTag> CompoundBinaryTag createRegistry(String registryName, Map<String, T> tags) {
     int id = 0;
 
     ListBinaryTag.Builder<CompoundBinaryTag> builder = ListBinaryTag.builder(BinaryTagTypes.COMPOUND);
-    for (Entry<String, CompoundBinaryTag> tag : tags.entrySet()) {
+    for (Entry<String, T> tag : tags.entrySet()) {
       builder.add(CompoundBinaryTag.builder()
           .putString("name", tag.getKey())
           .putInt("id", id++)
@@ -966,7 +993,9 @@ public class LimboImpl implements Limbo {
     joinGame.setEntityId(1);
     joinGame.setIsHardcore(true);
     joinGame.setGamemode(this.gameMode);
-    joinGame.setPreviousGamemode((short) -1);
+    // TODO: velocity bug: game uses GameType.OPTIONAL_STREAM_CODEC for 26.3+, but velocity encode optional as single byte.
+    //   should work fine even if set to 0. affects only f3+f4 gamemode switching menu.
+    joinGame.setPreviousGamemode((short) 0);
     joinGame.setDimension(dimension.getModernID());
     joinGame.setDifficulty((short) 0);
     // TODO: different JoinGame packets for different login types,
@@ -1240,14 +1269,18 @@ public class LimboImpl implements Limbo {
                 Map.of("minecraft:classic", soundVariant)));
 
             // Trim material
-            CompoundBinaryTag trim = CompoundBinaryTag.builder()
-                .putString("asset_name", "redstone")
+            CompoundBinaryTag.Builder trimBuilder = CompoundBinaryTag.builder()
                 .put("description", CompoundBinaryTag.builder()
                     .putString("color", "#971607")
                     .putString("translate", "trim_material.minecraft.redstone")
-                    .build())
-                .build();
+                    .build());
+            if (version.noLessThan(ProtocolVersion.MINECRAFT_26_3)) {
+              trimBuilder.putString("palette_id", "trim/redstone");
+            } else {
+              trimBuilder.putString("asset_name", "redstone");
+            }
 
+            CompoundBinaryTag trim = trimBuilder.build();
             Map<String, CompoundBinaryTag> trims = new HashMap<>();
             for (String trimName : List.of("amethyst", "copper", "diamond",
                 "emerald", "gold", "iron", "lapis", "netherite", "quartz",
@@ -1298,6 +1331,29 @@ public class LimboImpl implements Limbo {
                   .build());
             }
             registryContainer.put("minecraft:timeline", this.createRegistry("minecraft:timeline", timelines));
+          }
+
+          if (version.noLessThan(ProtocolVersion.MINECRAFT_26_3)) {
+            Map<String, CompoundBinaryTag> pots = new HashMap<>();
+            for (String potName : List.of("angler", "archer", "arms_up", "blade", "brewer", "burn", "danger",
+                "explorer", "flow", "friend", "guster", "heartbreak", "heart", "howl", "miner", "mourner",
+                "plenty", "prize", "scrape", "sheaf", "shelter", "skull", "snort")) {
+              pots.put(potName, CompoundBinaryTag.builder()
+                  .putString("asset_id", potName + "_pottery_pattern")
+                  .build());
+            }
+            registryContainer.put("decorated_pot_pattern", this.createRegistry("decorated_pot_pattern", pots));
+
+            ListBinaryTag transformer = ListBinaryTag.from(List.of(CompoundBinaryTag.builder()
+                .put("block_state_provider", CompoundBinaryTag.builder()
+                    .putString("type", "rule_based")
+                    .put("rules", ListBinaryTag.empty())
+                    .build()).build()));
+            Map<String, BinaryTag> transformers = new HashMap<>();
+            for (String potName : List.of("axe", "hoe", "shovel")) {
+              transformers.put(potName, transformer);
+            }
+            registryContainer.put("block_transformer", this.createRegistry("block_transformer", transformers));
           }
         } else {
           CompoundBinaryTag.Builder wolfVariant = CompoundBinaryTag.builder()
@@ -1463,12 +1519,7 @@ public class LimboImpl implements Limbo {
   }
 
   private PreparedPacket getBrandMessage(Class<? extends LimboSessionHandler> clazz) {
-    PreparedPacket preparedPacket = this.brandMessages.get(clazz);
-    if (preparedPacket == null) {
-      this.brandMessages.put(clazz, preparedPacket = this.plugin.createPreparedPacket().prepare(this::createBrandMessage).build());
-    }
-
-    return preparedPacket;
+    return this.brandMessages.computeIfAbsent(clazz, key -> this.plugin.createPreparedPacket().prepare(this::createBrandMessage).build());
   }
 
   private PluginMessagePacket createBrandMessage(ProtocolVersion version) {
